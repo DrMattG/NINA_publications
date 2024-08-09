@@ -1,0 +1,146 @@
+---
+title: "using OpenAlex to get publications"
+format: html
+editor: visual
+---
+
+## 
+
+```{r}
+library(rnaturalearth)
+library(sf)
+library(geosphere)
+library(tidyverse)
+
+```
+
+```{r}
+extract_country_count <- function(authors_df) {
+  # Remove rows where the institution is "Norwegian Institute for Nature Research"
+  filtered_df <- authors_df[authors_df$institution_display_name != "Norwegian Institute for Nature Research", ]
+  
+  # Count occurrences of each country
+  country_count <- filtered_df %>%
+    group_by(institution_country_code) %>%
+    summarise(count = n()) %>%
+    ungroup()
+  
+  return(country_count)
+}
+
+
+```
+
+```{r}
+
+NINA_works <- readRDS("C:/Users/matthew.grainger/Documents/Projects_in_development/NINA_publications/data/NINA_works.RDS")
+
+
+# Assuming NINA_works is your main dataframe and `author` is the list-column containing the dataframes
+all_country_counts <- lapply(NINA_works$author, extract_country_count)
+
+# Combine all individual country counts into one dataframe
+combined_country_counts <- bind_rows(all_country_counts) %>%
+  group_by(institution_country_code) %>%
+  summarise(total_count = sum(count)) %>%
+  arrange(desc(total_count))
+
+combined_country_counts
+
+
+# Load the world map using rnaturalearth, but this time extract the centroids differently
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Extract country codes and their centroid coordinates using st_centroid()
+# We'll simplify by applying st_make_valid to correct any invalid geometries
+world <- st_make_valid(world)
+
+# Calculate centroids
+world_centroids <- st_centroid(world)
+
+# Extract the centroids as a dataframe with coordinates and country codes
+country_coords <- cbind(
+  st_coordinates(world_centroids), 
+  world %>% select(iso_a2) %>% st_drop_geometry()
+)
+
+# Rename columns for clarity
+colnames(country_coords) <- c("lon", "lat", "institution_country_code")
+
+# Assuming combined_country_counts is your dataframe with the co-authorship counts
+combined_country_counts <- combined_country_counts %>%
+  left_join(country_coords, by = "institution_country_code")
+
+# Remove rows with missing coordinates
+combined_country_counts <- combined_country_counts %>%
+  filter(!is.na(lon) & !is.na(lat))
+
+
+# Norway coordinates (for Oslo)
+norway_coords <- data.frame(lon = 10.75, lat = 59.91)
+
+# Calculate great circle routes with error handling
+routes <- lapply(1:nrow(combined_country_counts), function(i) {
+  tryCatch({
+    # Calculate the great circle route
+    route <- gcIntermediate(
+      norway_coords, 
+      combined_country_counts[i, c("lon", "lat")], 
+      n = 50, 
+      addStartEnd = TRUE, 
+      sp = TRUE
+    )
+    
+    # Extract coordinates from the SpatialLines object
+    coords <- do.call(rbind, lapply(route@lines[[1]]@Lines, function(x) x@coords))
+    
+    # Create a data frame with the route coordinates and country information
+    data.frame(
+      lon = coords[, 1],
+      lat = coords[, 2],
+      institution_country_code = combined_country_counts$institution_country_code[i],
+      total_count = combined_country_counts$total_count[i]
+    )
+  }, error = function(e) {
+    # In case of error, return NULL to skip this iteration
+    NULL
+  })
+})
+
+# Filter out any NULL results from failed route calculations
+routes_df <- do.call(rbind, routes[!sapply(routes, is.null)])
+
+# Base world map
+world_map <- map_data("world")
+
+# Plot
+ggplot() +
+  geom_polygon(data = world_map, aes(x = long, y = lat, group = group), fill = "darkslategray", color = "white") +
+  geom_path(data = routes_df, aes(x = lon, y = lat, group = institution_country_code, size = total_count), color = "red", alpha = 0.4) +
+  geom_point(data = combined_country_counts, aes(x = lon, y = lat, size = (total_count/10)), color = "red") +
+  geom_point(data = norway_coords, aes(x = lon, y = lat), color = "darkred", size = 4) +
+  theme_bw() +
+  labs(
+    title = "Co-authorship Links from Norway",
+    size = "Number of Co-authorships"
+  ) +
+  theme(legend.position = "bottom")
+
+```
+
+```{r}
+# Plot
+ggplot() +
+  geom_polygon(data = world_map, aes(x = long, y = lat, group = group), fill = "darkslategray", color = "white") +
+  geom_path(data = routes_df, aes(x = lon, y = lat, group = institution_country_code, size = total_count), color = "red", alpha = 0.4) +
+  geom_point(data = combined_country_counts, aes(x = lon, y = lat, size = (total_count/10)), color = "red") +
+  geom_point(data = norway_coords, aes(x = lon, y = lat), color = "darkred", size = 4) +
+  theme_void() +
+  # labs(
+  #   title = "Co-authorship Links from Norway",
+  #   size = "Number of Co-authorships"
+  # ) +
+  theme(legend.position = "none")
+
+#ggsave(filename = "images/co-author_map.png",plot = last_plot(),width =998, height=550 )
+```
